@@ -34,6 +34,14 @@ const (
 	TCPECNBits TCPFlag = TCPECNEcho | TCPCWR
 )
 
+// CaptureMeta contains metadata that is used when debugging.
+type CaptureMeta struct {
+	DidSNAT     bool           // SNAT was performed & the address was updated.
+	OriginalSrc netip.AddrPort // The source address before SNAT was performed.
+	DidDNAT     bool           // DNAT was performed & the address was updated.
+	OriginalDst netip.AddrPort // The destination address before DNAT was performed.
+}
+
 // Parsed is a minimal decoding of a packet suitable for use in filters.
 type Parsed struct {
 	// b is the byte buffer that this decodes.
@@ -58,6 +66,9 @@ type Parsed struct {
 	Dst netip.AddrPort
 	// TCPFlags is the packet's TCP flag bits. Valid iff IPProto == TCP.
 	TCPFlags TCPFlag
+
+	// CaptureMeta contains metadata that is used when debugging.
+	CaptureMeta CaptureMeta
 }
 
 func (p *Parsed) String() string {
@@ -84,6 +95,7 @@ func (p *Parsed) String() string {
 // and shouldn't need any memory allocation.
 func (q *Parsed) Decode(b []byte) {
 	q.b = b
+	q.CaptureMeta = CaptureMeta{} // Clear any capture metadata if it exists.
 
 	if len(b) < 1 {
 		q.IPVersion = 0
@@ -381,6 +393,11 @@ func (q *Parsed) Buffer() []byte {
 // Payload returns the payload of the IP subprotocol section.
 // This is a read-only view; that is, q retains the ownership of the buffer.
 func (q *Parsed) Payload() []byte {
+	// If the packet is truncated, return nothing instead of crashing.
+	if q.length > len(q.b) || q.dataofs > len(q.b) {
+		return nil
+	}
+
 	return q.b[q.dataofs:q.length]
 }
 
@@ -404,13 +421,13 @@ func (q *Parsed) IsError() bool {
 			return false
 		}
 		t := ICMP4Type(q.b[q.subofs])
-		return t == ICMP4Unreachable || t == ICMP4TimeExceeded
+		return t == ICMP4Unreachable || t == ICMP4TimeExceeded || t == ICMP4ParamProblem
 	case ipproto.ICMPv6:
 		if len(q.b) < q.subofs+8 {
 			return false
 		}
 		t := ICMP6Type(q.b[q.subofs])
-		return t == ICMP6Unreachable || t == ICMP6TimeExceeded
+		return t == ICMP6Unreachable || t == ICMP6PacketTooBig || t == ICMP6TimeExceeded || t == ICMP6ParamProblem
 	default:
 		return false
 	}

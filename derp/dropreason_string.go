@@ -13,16 +13,17 @@ func _() {
 	var x [1]struct{}
 	_ = x[dropReasonUnknownDest-0]
 	_ = x[dropReasonUnknownDestOnFwd-1]
-	_ = x[dropReasonGone-2]
+	_ = x[dropReasonGoneDisconnected-2]
 	_ = x[dropReasonQueueHead-3]
 	_ = x[dropReasonQueueTail-4]
 	_ = x[dropReasonWriteError-5]
 	_ = x[dropReasonDupClient-6]
+	_ = x[numDropReasons-7]
 }
 
-const _dropReason_name = "UnknownDestUnknownDestOnFwdGoneQueueHeadQueueTailWriteErrorDupClient"
+const _dropReason_name = "UnknownDestUnknownDestOnFwdGoneDisconnectedQueueHeadQueueTailWriteErrorDupClientnumDropReasons"
 
-var _dropReason_index = [...]uint8{0, 11, 27, 31, 40, 49, 59, 68}
+var _dropReason_index = [...]uint8{0, 11, 27, 43, 52, 61, 71, 80, 94}
 
 func (i dropReason) String() string {
 	if i < 0 || i >= dropReason(len(_dropReason_index)-1) {

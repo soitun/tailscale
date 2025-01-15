@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !js
+//go:build !wasm && !plan9 && !tamago && !aix && !solaris && !illumos
 
 // Package tun creates a tuntap device, working around OS-specific
 // quirks if necessary.
@@ -14,17 +14,15 @@ import (
 	"time"
 
 	"github.com/tailscale/wireguard-go/tun"
-	"tailscale.com/envknob"
 	"tailscale.com/types/logger"
 )
 
 // createTAP is non-nil on Linux.
-var createTAP func(tapName, bridgeName string) (tun.Device, error)
+var createTAP func(logf logger.Logf, tapName, bridgeName string) (tun.Device, error)
 
 // New returns a tun.Device for the requested device name, along with
 // the OS-dependent name that was allocated to the device.
 func New(logf logger.Logf, tunName string) (tun.Device, string, error) {
-	var disableTUNOffload = envknob.Bool("TS_DISABLE_TUN_OFFLOAD")
 	var dev tun.Device
 	var err error
 	if strings.HasPrefix(tunName, "tap:") {
@@ -44,18 +42,9 @@ func New(logf logger.Logf, tunName string) (tun.Device, string, error) {
 		default:
 			return nil, "", errors.New("bogus tap argument")
 		}
-		dev, err = createTAP(tapName, bridgeName)
+		dev, err = createTAP(logf, tapName, bridgeName)
 	} else {
-		tunMTU := DefaultMTU
-		if mtu, ok := envknob.LookupInt("TS_DEBUG_MTU"); ok {
-			tunMTU = mtu
-		}
-		dev, err = tun.CreateTUN(tunName, tunMTU)
-		if err == nil && disableTUNOffload {
-			if do, ok := dev.(tun.DisableOffloader); ok {
-				do.DisableOffload()
-			}
-		}
+		dev, err = tun.CreateTUN(tunName, int(DefaultTUNMTU()))
 	}
 	if err != nil {
 		return nil, "", err

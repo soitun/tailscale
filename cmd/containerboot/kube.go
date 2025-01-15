@@ -6,204 +6,101 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
 	"net/http"
+	"net/netip"
 	"os"
-	"path/filepath"
-	"strings"
-	"time"
 
+	"tailscale.com/kube/kubeapi"
+	"tailscale.com/kube/kubeclient"
+	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tailcfg"
-	"tailscale.com/util/multierr"
 )
 
-// checkSecretPermissions checks the secret access permissions of the current
-// pod. It returns an error if the basic permissions tailscale needs are
-// missing, and reports whether the patch permission is additionally present.
-//
-// Errors encountered during the access checking process are logged, but ignored
-// so that the pod tries to fail alive if the permissions exist and there's just
-// something wrong with SelfSubjectAccessReviews. There shouldn't be, pods
-// should always be able to use SSARs to assess their own permissions, but since
-// we didn't use to check permissions this way we'll be cautious in case some
-// old version of k8s deviates from the current behavior.
-func checkSecretPermissions(ctx context.Context, secretName string) (canPatch bool, err error) {
-	var errs []error
-	for _, verb := range []string{"get", "update"} {
-		ok, err := checkPermission(ctx, verb, secretName)
-		if err != nil {
-			log.Printf("error checking %s permission on secret %s: %v", verb, secretName, err)
-		} else if !ok {
-			errs = append(errs, fmt.Errorf("missing %s permission on secret %q", verb, secretName))
-		}
-	}
-	if len(errs) > 0 {
-		return false, multierr.New(errs...)
-	}
-	ok, err := checkPermission(ctx, "patch", secretName)
-	if err != nil {
-		log.Printf("error checking patch permission on secret %s: %v", secretName, err)
-		return false, nil
-	}
-	return ok, nil
+// kubeClient is a wrapper around Tailscale's internal kube client that knows how to talk to the kube API server. We use
+// this rather than any of the upstream Kubernetes client libaries to avoid extra imports.
+type kubeClient struct {
+	kubeclient.Client
+	stateSecret string
+	canPatch    bool // whether the client has permissions to patch Kubernetes Secrets
 }
 
-// checkPermission reports whether the current pod has permission to use the
-// given verb (e.g. get, update, patch) on secretName.
-func checkPermission(ctx context.Context, verb, secretName string) (bool, error) {
-	sar := map[string]any{
-		"apiVersion": "authorization.k8s.io/v1",
-		"kind":       "SelfSubjectAccessReview",
-		"spec": map[string]any{
-			"resourceAttributes": map[string]any{
-				"namespace": kubeNamespace,
-				"verb":      verb,
-				"resource":  "secrets",
-				"name":      secretName,
-			},
+func newKubeClient(root string, stateSecret string) (*kubeClient, error) {
+	if root != "/" {
+		// If we are running in a test, we need to set the root path to the fake
+		// service account directory.
+		kubeclient.SetRootPathForTesting(root)
+	}
+	var err error
+	kc, err := kubeclient.New("tailscale-container")
+	if err != nil {
+		return nil, fmt.Errorf("Error creating kube client: %w", err)
+	}
+	if (root != "/") || os.Getenv("TS_KUBERNETES_READ_API_SERVER_ADDRESS_FROM_ENV") == "true" {
+		// Derive the API server address from the environment variables
+		// Used to set http server in tests, or optionally enabled by flag
+		kc.SetURL(fmt.Sprintf("https://%s:%s", os.Getenv("KUBERNETES_SERVICE_HOST"), os.Getenv("KUBERNETES_SERVICE_PORT_HTTPS")))
+	}
+	return &kubeClient{Client: kc, stateSecret: stateSecret}, nil
+}
+
+// storeDeviceID writes deviceID to 'device_id' data field of the client's state Secret.
+func (kc *kubeClient) storeDeviceID(ctx context.Context, deviceID tailcfg.StableNodeID) error {
+	s := &kubeapi.Secret{
+		Data: map[string][]byte{
+			kubetypes.KeyDeviceID: []byte(deviceID),
 		},
 	}
-	bs, err := json.Marshal(sar)
-	if err != nil {
-		return false, err
-	}
-	req, err := http.NewRequest("POST", "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews", bytes.NewReader(bs))
-	if err != nil {
-		return false, err
-	}
-	resp, err := doKubeRequest(ctx, req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-	bs, err = io.ReadAll(resp.Body)
-	if err != nil {
-		return false, err
-	}
-	var res struct {
-		Status struct {
-			Allowed bool `json:"allowed"`
-		} `json:"status"`
-	}
-	if err := json.Unmarshal(bs, &res); err != nil {
-		return false, err
-	}
-	return res.Status.Allowed, nil
+	return kc.StrategicMergePatchSecret(ctx, kc.stateSecret, s, "tailscale-container")
 }
 
-// findKeyInKubeSecret inspects the kube secret secretName for a data
-// field called "authkey", and returns its value if present.
-func findKeyInKubeSecret(ctx context.Context, secretName string) (string, error) {
-	req, err := http.NewRequest("GET", fmt.Sprintf("/api/v1/namespaces/%s/secrets/%s", kubeNamespace, secretName), nil)
-	if err != nil {
-		return "", err
+// storeDeviceEndpoints writes device's tailnet IPs and MagicDNS name to fields 'device_ips', 'device_fqdn' of client's
+// state Secret.
+func (kc *kubeClient) storeDeviceEndpoints(ctx context.Context, fqdn string, addresses []netip.Prefix) error {
+	var ips []string
+	for _, addr := range addresses {
+		ips = append(ips, addr.Addr().String())
 	}
-	resp, err := doKubeRequest(ctx, req)
-	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
-			// Kube secret doesn't exist yet, can't have an authkey.
-			return "", nil
-		}
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	bs, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	// We use a map[string]any here rather than import corev1.Secret,
-	// because we only do very limited things to the secret, and
-	// importing corev1 adds 12MiB to the compiled binary.
-	var s map[string]any
-	if err := json.Unmarshal(bs, &s); err != nil {
-		return "", err
-	}
-	if d, ok := s["data"].(map[string]any); ok {
-		if v, ok := d["authkey"].(string); ok {
-			bs, err := base64.StdEncoding.DecodeString(v)
-			if err != nil {
-				return "", err
-			}
-			return string(bs), nil
-		}
-	}
-	return "", nil
-}
-
-// storeDeviceInfo writes deviceID into the "device_id" data field of the kube
-// secret secretName.
-func storeDeviceInfo(ctx context.Context, secretName string, deviceID tailcfg.StableNodeID, fqdn string) error {
-	// First check if the secret exists at all. Even if running on
-	// kubernetes, we do not necessarily store state in a k8s secret.
-	req, err := http.NewRequest("GET", fmt.Sprintf("/api/v1/namespaces/%s/secrets/%s", kubeNamespace, secretName), nil)
+	deviceIPs, err := json.Marshal(ips)
 	if err != nil {
 		return err
 	}
-	resp, err := doKubeRequest(ctx, req)
-	if err != nil {
-		if resp != nil && resp.StatusCode >= 400 && resp.StatusCode <= 499 {
-			// Assume the secret doesn't exist, or we don't have
-			// permission to access it.
-			return nil
-		}
-		return err
-	}
 
-	m := map[string]map[string]string{
-		"stringData": {
-			"device_id":   string(deviceID),
-			"device_fqdn": fqdn,
+	s := &kubeapi.Secret{
+		Data: map[string][]byte{
+			kubetypes.KeyDeviceFQDN: []byte(fqdn),
+			kubetypes.KeyDeviceIPs:  deviceIPs,
 		},
 	}
-	var b bytes.Buffer
-	if err := json.NewEncoder(&b).Encode(m); err != nil {
-		return err
+	return kc.StrategicMergePatchSecret(ctx, kc.stateSecret, s, "tailscale-container")
+}
+
+// storeHTTPSEndpoint writes an HTTPS endpoint exposed by this device via 'tailscale serve' to the client's state
+// Secret. In practice this will be the same value that gets written to 'device_fqdn', but this should only be called
+// when the serve config has been successfully set up.
+func (kc *kubeClient) storeHTTPSEndpoint(ctx context.Context, ep string) error {
+	s := &kubeapi.Secret{
+		Data: map[string][]byte{
+			kubetypes.KeyHTTPSEndpoint: []byte(ep),
+		},
 	}
-	req, err = http.NewRequest("PATCH", fmt.Sprintf("/api/v1/namespaces/%s/secrets/%s?fieldManager=tailscale-container", kubeNamespace, secretName), &b)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/strategic-merge-patch+json")
-	if _, err := doKubeRequest(ctx, req); err != nil {
-		return err
-	}
-	return nil
+	return kc.StrategicMergePatchSecret(ctx, kc.stateSecret, s, "tailscale-container")
 }
 
 // deleteAuthKey deletes the 'authkey' field of the given kube
 // secret. No-op if there is no authkey in the secret.
-func deleteAuthKey(ctx context.Context, secretName string) error {
+func (kc *kubeClient) deleteAuthKey(ctx context.Context) error {
 	// m is a JSON Patch data structure, see https://jsonpatch.com/ or RFC 6902.
-	m := []struct {
-		Op   string `json:"op"`
-		Path string `json:"path"`
-	}{
+	m := []kubeclient.JSONPatch{
 		{
 			Op:   "remove",
 			Path: "/data/authkey",
 		},
 	}
-	var b bytes.Buffer
-	if err := json.NewEncoder(&b).Encode(m); err != nil {
-		return err
-	}
-	req, err := http.NewRequest("PATCH", fmt.Sprintf("/api/v1/namespaces/%s/secrets/%s?fieldManager=tailscale-container", kubeNamespace, secretName), &b)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json-patch+json")
-	if resp, err := doKubeRequest(ctx, req); err != nil {
-		if resp != nil && resp.StatusCode == http.StatusUnprocessableEntity {
+	if err := kc.JSONPatchResource(ctx, kc.stateSecret, kubeclient.TypeSecrets, m); err != nil {
+		if s, ok := err.(*kubeapi.Status); ok && s.Code == http.StatusUnprocessableEntity {
 			// This is kubernetes-ese for "the field you asked to
 			// delete already doesn't exist", aka no-op.
 			return nil
@@ -213,65 +110,19 @@ func deleteAuthKey(ctx context.Context, secretName string) error {
 	return nil
 }
 
-var (
-	kubeHost      string
-	kubeNamespace string
-	kubeToken     string
-	kubeHTTP      *http.Transport
-)
-
-func initKube(root string) {
-	// If running in Kubernetes, set things up so that doKubeRequest
-	// can talk successfully to the kube apiserver.
-	if os.Getenv("KUBERNETES_SERVICE_HOST") == "" {
-		return
+// storeCapVerUID stores the current capability version of tailscale and, if provided, UID of the Pod in the tailscale
+// state Secret.
+// These two fields are used by the Kubernetes Operator to observe the current capability version of tailscaled running in this container.
+func (kc *kubeClient) storeCapVerUID(ctx context.Context, podUID string) error {
+	capVerS := fmt.Sprintf("%d", tailcfg.CurrentCapabilityVersion)
+	d := map[string][]byte{
+		kubetypes.KeyCapVer: []byte(capVerS),
 	}
-
-	kubeHost = os.Getenv("KUBERNETES_SERVICE_HOST") + ":" + os.Getenv("KUBERNETES_SERVICE_PORT_HTTPS")
-
-	bs, err := os.ReadFile(filepath.Join(root, "var/run/secrets/kubernetes.io/serviceaccount/namespace"))
-	if err != nil {
-		log.Fatalf("Error reading kube namespace: %v", err)
+	if podUID != "" {
+		d[kubetypes.KeyPodUID] = []byte(podUID)
 	}
-	kubeNamespace = strings.TrimSpace(string(bs))
-
-	bs, err = os.ReadFile(filepath.Join(root, "var/run/secrets/kubernetes.io/serviceaccount/token"))
-	if err != nil {
-		log.Fatalf("Error reading kube token: %v", err)
+	s := &kubeapi.Secret{
+		Data: d,
 	}
-	kubeToken = strings.TrimSpace(string(bs))
-
-	bs, err = os.ReadFile(filepath.Join(root, "var/run/secrets/kubernetes.io/serviceaccount/ca.crt"))
-	if err != nil {
-		log.Fatalf("Error reading kube CA cert: %v", err)
-	}
-	cp := x509.NewCertPool()
-	cp.AppendCertsFromPEM(bs)
-	kubeHTTP = &http.Transport{
-		TLSClientConfig: &tls.Config{
-			RootCAs: cp,
-		},
-		IdleConnTimeout: time.Second,
-	}
-}
-
-// doKubeRequest sends r to the kube apiserver.
-func doKubeRequest(ctx context.Context, r *http.Request) (*http.Response, error) {
-	if kubeHTTP == nil {
-		panic("not in kubernetes")
-	}
-
-	r.URL.Scheme = "https"
-	r.URL.Host = kubeHost
-	r.Header.Set("Authorization", "Bearer "+kubeToken)
-	r.Header.Set("Accept", "application/json")
-
-	resp, err := kubeHTTP.RoundTrip(r)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return resp, fmt.Errorf("got non-200/201 status code %d", resp.StatusCode)
-	}
-	return resp, nil
+	return kc.StrategicMergePatchSecret(ctx, kc.stateSecret, s, "tailscale-container")
 }
