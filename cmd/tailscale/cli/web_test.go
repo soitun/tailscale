@@ -3,7 +3,9 @@
 
 package cli
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestUrlOfListenAddr(t *testing.T) {
 	tests := []struct {
@@ -34,9 +36,9 @@ func TestUrlOfListenAddr(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			url := urlOfListenAddr(tt.in)
-			if url != tt.want {
-				t.Errorf("expected url: %q, got: %q", tt.want, url)
+			u := urlOfListenAddr(tt.in)
+			if u != tt.want {
+				t.Errorf("expected url: %q, got: %q", tt.want, u)
 			}
 		})
 	}

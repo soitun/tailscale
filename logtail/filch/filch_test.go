@@ -12,6 +12,8 @@ import (
 	"testing"
 	"unicode"
 	"unsafe"
+
+	"tailscale.com/tstest"
 )
 
 type filchTest struct {
@@ -73,11 +75,11 @@ func TestDropOldLogs(t *testing.T) {
 			f := newFilchTest(t, filePrefix, Options{ReplaceStderr: false, MaxFileSize: 1000})
 			defer f.close(t)
 			// Make filch rotate the logs 3 times
-			for i := 0; i < tc.write; i++ {
+			for range tc.write {
 				f.write(t, line1)
 			}
 			// We should only be able to read the last 150 lines
-			for i := 0; i < tc.read; i++ {
+			for i := range tc.read {
 				f.read(t, line1)
 				if t.Failed() {
 					t.Logf("could only read %d lines", i)
@@ -177,10 +179,7 @@ func TestFilchStderr(t *testing.T) {
 	defer pipeR.Close()
 	defer pipeW.Close()
 
-	stderrFD = int(pipeW.Fd())
-	defer func() {
-		stderrFD = 2
-	}()
+	tstest.Replace(t, &stderrFD, int(pipeW.Fd()))
 
 	filePrefix := t.TempDir()
 	f := newFilchTest(t, filePrefix, Options{ReplaceStderr: true})

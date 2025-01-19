@@ -1,8 +1,6 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-// TODO(bradfitz): update this code to use netaddr more
-
 // Package dnscache contains a minimal DNS cache that makes a bunch of
 // assumptions that are only valid for us. Not recommended for general use.
 package dnscache
@@ -24,6 +22,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/util/cloudenv"
 	"tailscale.com/util/singleflight"
+	"tailscale.com/util/slicesx"
 )
 
 var zaddr netip.Addr
@@ -136,10 +135,6 @@ func (r *Resolver) cloudHostResolver() (v *net.Resolver, ok bool) {
 	switch runtime.GOOS {
 	case "android", "ios", "darwin":
 		return nil, false
-	case "windows":
-		// TODO(bradfitz): remove this restriction once we're using Go 1.19
-		// which supports net.Resolver.PreferGo on Windows.
-		return nil, false
 	}
 	ip := cloudenv.Get().ResolverIP()
 	if ip == "" {
@@ -218,8 +213,8 @@ func (r *Resolver) LookupIP(ctx context.Context, host string) (ip, v6 netip.Addr
 		return ip, ip6, allIPs, nil
 	}
 
-	ch := r.sf.DoChan(host, func() (ret ipRes, _ error) {
-		ip, ip6, allIPs, err := r.lookupIP(host)
+	ch := r.sf.DoChanContext(ctx, host, func(ctx context.Context) (ret ipRes, _ error) {
+		ip, ip6, allIPs, err := r.lookupIP(ctx, host)
 		if err != nil {
 			return ret, err
 		}
@@ -280,30 +275,30 @@ func (r *Resolver) lookupTimeoutForHost(host string) time.Duration {
 	return 10 * time.Second
 }
 
-func (r *Resolver) lookupIP(host string) (ip, ip6 netip.Addr, allIPs []netip.Addr, err error) {
+func (r *Resolver) lookupIP(ctx context.Context, host string) (ip, ip6 netip.Addr, allIPs []netip.Addr, err error) {
 	if ip, ip6, allIPs, ok := r.lookupIPCache(host); ok {
 		r.dlogf("%q found in cache as %v", host, ip)
 		return ip, ip6, allIPs, nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), r.lookupTimeoutForHost(host))
-	defer cancel()
-	ips, err := r.fwd().LookupNetIP(ctx, "ip", host)
+	lookupCtx, lookupCancel := context.WithTimeout(ctx, r.lookupTimeoutForHost(host))
+	defer lookupCancel()
+	ips, err := r.fwd().LookupNetIP(lookupCtx, "ip", host)
 	if err != nil || len(ips) == 0 {
 		if resolver, ok := r.cloudHostResolver(); ok {
 			r.dlogf("resolving %q via cloud resolver", host)
-			ips, err = resolver.LookupNetIP(ctx, "ip", host)
+			ips, err = resolver.LookupNetIP(lookupCtx, "ip", host)
 		}
 	}
 	if (err != nil || len(ips) == 0) && r.LookupIPFallback != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
+		lookupCtx, lookupCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer lookupCancel()
 		if err != nil {
 			r.dlogf("resolving %q using fallback resolver due to error", host)
 		} else {
 			r.dlogf("resolving %q using fallback resolver due to no returned IPs", host)
 		}
-		ips, err = r.LookupIPFallback(ctx, host)
+		ips, err = r.LookupIPFallback(lookupCtx, host)
 	}
 	if err != nil {
 		return netip.Addr{}, netip.Addr{}, nil, err
@@ -421,10 +416,10 @@ func (d *dialer) DialContext(ctx context.Context, network, address string) (retC
 	if len(i4s) < 2 {
 		d.dnsCache.dlogf("dialing %s, %s for %s", network, ip, address)
 		c, err := dc.dialOne(ctx, ip.Unmap())
-		if err == nil || ctx.Err() != nil {
+		if err == nil || ctx.Err() != nil || !ip6.IsValid() {
 			return c, err
 		}
-		// Fall back to trying IPv6, if any.
+		// Fall back to trying IPv6.
 		return dc.dialOne(ctx, ip6)
 	}
 
@@ -577,7 +572,7 @@ func (dc *dialCall) raceDial(ctx context.Context, ips []netip.Addr) (net.Conn, e
 			iv4 = append(iv4, ip)
 		}
 	}
-	ips = interleaveSlices(iv6, iv4)
+	ips = slicesx.Interleave(iv6, iv4)
 
 	go func() {
 		for i, ip := range ips {
@@ -636,21 +631,6 @@ func (dc *dialCall) raceDial(ctx context.Context, ips []netip.Addr) (net.Conn, e
 	}
 }
 
-// interleaveSlices combines two slices of the form [a, b, c] and [x, y, z]
-// into a slice with elements interleaved; i.e. [a, x, b, y, c, z].
-func interleaveSlices[T any](a, b []T) []T {
-	var (
-		i   int
-		ret = make([]T, 0, len(a)+len(b))
-	)
-	for i = 0; i < len(a) && i < len(b); i++ {
-		ret = append(ret, a[i], b[i])
-	}
-	ret = append(ret, a[i:]...)
-	ret = append(ret, b[i:]...)
-	return ret
-}
-
 func v4addrs(aa []netip.Addr) (ret []netip.Addr) {
 	for _, a := range aa {
 		a = a.Unmap()
@@ -669,8 +649,6 @@ func v6addrs(aa []netip.Addr) (ret []netip.Addr) {
 	}
 	return ret
 }
-
-var errTLSHandshakeTimeout = errors.New("timeout doing TLS handshake")
 
 // TLSDialer is like Dialer but returns a func suitable for using with net/http.Transport.DialTLSContext.
 // It returns a *tls.Conn type on success.

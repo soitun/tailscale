@@ -6,13 +6,12 @@ package distro
 
 import (
 	"bytes"
-	"io"
 	"os"
 	"runtime"
 	"strconv"
 
 	"tailscale.com/types/lazy"
-	"tailscale.com/util/lineread"
+	"tailscale.com/util/lineiter"
 )
 
 type Distro string
@@ -29,9 +28,13 @@ const (
 	TrueNAS   = Distro("truenas")
 	Gokrazy   = Distro("gokrazy")
 	WDMyCloud = Distro("wdmycloud")
+	Unraid    = Distro("unraid")
+	Alpine    = Distro("alpine")
+	UBNT      = Distro("ubnt") // Ubiquiti Networks
 )
 
 var distro lazy.SyncValue[Distro]
+var isWSL lazy.SyncValue[bool]
 
 // Get returns the current distro, or the empty string if unknown.
 func Get() Distro {
@@ -44,6 +47,15 @@ func Get() Distro {
 		default:
 			return Distro("")
 		}
+	})
+}
+
+// IsWSL reports whether we're running in the Windows Subsystem for Linux.
+func IsWSL() bool {
+	return runtime.GOOS == "linux" && isWSL.Get(func() bool {
+		// We could look for $WSL_INTEROP instead, however that may be missing if
+		// the user has started to use systemd in WSL2.
+		return have("/proc/sys/fs/binfmt_misc/WSLInterop") || have("/mnt/wsl")
 	})
 }
 
@@ -64,6 +76,12 @@ func linuxDistro() Distro {
 	case have("/usr/local/bin/freenas-debug"):
 		// TrueNAS Scale runs on debian
 		return TrueNAS
+	case have("/usr/bin/ubnt-device-info"):
+		// UBNT runs on Debian-based systems. This MUST be checked before Debian.
+		//
+		// Currently supported product families:
+		// - UDM (UniFi Dream Machine, UDM-Pro)
+		return UBNT
 	case have("/etc/debian_version"):
 		return Debian
 	case have("/etc/arch-release"):
@@ -80,6 +98,10 @@ func linuxDistro() Distro {
 		return WDMyCloud
 	case have("/usr/sbin/wd_crontab.sh"): // Western Digital MyCloud OS5
 		return WDMyCloud
+	case have("/etc/unraid-version"):
+		return Unraid
+	case have("/etc/alpine-release"):
+		return Alpine
 	}
 	return ""
 }
@@ -116,18 +138,19 @@ func DSMVersion() int {
 			return v
 		}
 		// But when run from the command line, we have to read it from the file:
-		lineread.File("/etc/VERSION", func(line []byte) error {
+		for lr := range lineiter.File("/etc/VERSION") {
+			line, err := lr.Value()
+			if err != nil {
+				break // but otherwise ignore
+			}
 			line = bytes.TrimSpace(line)
 			if string(line) == `majorversion="7"` {
-				v = 7
-				return io.EOF
+				return 7
 			}
 			if string(line) == `majorversion="6"` {
-				v = 6
-				return io.EOF
+				return 6
 			}
-			return nil
-		})
-		return v
+		}
+		return 0
 	})
 }

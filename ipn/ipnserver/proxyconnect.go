@@ -14,7 +14,7 @@ import (
 )
 
 // handleProxyConnectConn handles a CONNECT request to
-// log.tailscale.io (or whatever the configured log server is). This
+// log.tailscale.com (or whatever the configured log server is). This
 // is intended for use by the Windows GUI client to log via when an
 // exit node is in use, so the logs don't go out via the exit node and
 // instead go directly, like tailscaled's. The dialer tried to do that
@@ -37,8 +37,8 @@ func (s *Server) handleProxyConnectConn(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	tr := logpolicy.NewLogtailTransport(logHost)
-	back, err := tr.DialContext(ctx, "tcp", hostPort)
+	dialContext := logpolicy.MakeDialFunc(s.netMon, s.logf)
+	back, err := dialContext(ctx, "tcp", hostPort)
 	if err != nil {
 		s.logf("error CONNECT dialing %v: %v", hostPort, err)
 		http.Error(w, "Connect failure", http.StatusBadGateway)
@@ -48,7 +48,7 @@ func (s *Server) handleProxyConnectConn(w http.ResponseWriter, r *http.Request) 
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "CONNECT hijack unavailable", http.StatusInternalServerError)
 		return
 	}
 	c, br, err := hj.Hijack()
